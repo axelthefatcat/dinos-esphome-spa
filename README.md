@@ -4,6 +4,8 @@ An ESPHome configuration for Balboa-controlled spas that adds a **Ready At** hea
 
 It runs entirely on the ESP32, so it keeps working if Home Assistant is down, and everything shows up in Home Assistant automatically.
 
+📖 **Write-up:** [A Ready At heat-up planner for my Balboa spa with ESPHome](https://www.matthews.casa/ready-at-heat-up-planner-balboa-spa-esphome/) on [Dean's Workbench](https://www.matthews.casa)
+
 > ### Built on esphome-balboa-spa by Brian Feucht
 > All the hard work of talking to the spa is done by **[brianfeucht/esphome-balboa-spa](https://github.com/brianfeucht/esphome-balboa-spa)**, Brian Feucht's ESPHome external component. It reads the Balboa controller's serial protocol and provides the thermostat, jets, lights, filters, fault log and everything else. This repository is just a configuration that sits on top of it. Please star his project, read his README and report component issues there.
 >
@@ -264,4 +266,8 @@ This configuration and documentation are by Dean Matthews and released under the
 
 Not affiliated with or endorsed by Balboa Water Group. "Balboa" is used only to describe compatible equipment. You're controlling a heater and pumps, so use this at your own risk and keep an eye on it when you first set it up.
 
-More projects: [Dean's Workbench](https://www.matthews.casa)
+## More from Dean's Workbench
+
+- **This project's write-up:** [A Ready At heat-up planner for my Balboa spa with ESPHome](https://www.matthews.casa/ready-at-heat-up-planner-balboa-spa-esphome/)
+- **Website:** [www.matthews.casa](https://www.matthews.casa): articles on Home Assistant, automation, PowerShell and music
+- **Other projects:** [echo-home-stream](https://github.com/axelthefatcat/echo-home-stream) (play your own audio stream on Amazon Echo) and [dinos-discogs-tagger](https://github.com/axelthefatcat/dinos-discogs-tagger) (fix music tags with PowerShell)
