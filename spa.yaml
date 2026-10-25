@@ -1,0 +1,621 @@
+# =============================================================================
+# Dino's ESPHome Spa
+# https://github.com/axelthefatcat/dinos-esphome-spa
+#
+# ESPHome config for a Balboa-controlled spa, built on Brian Feucht's
+# esphome-balboa-spa component (https://github.com/brianfeucht/esphome-balboa-spa),
+# which does all the work of talking to the spa. This file adds a "Ready At"
+# heat-up planner that learns how fast your spa heats.
+#
+# Before you install:
+#   1. Copy secrets.example.yaml to your ESPHome secrets.yaml and fill it in.
+#   2. Check the board, UART pins and temperature scale match your build.
+#   3. Set your time zone under time: > sntp.
+#   4. Remove any entities your spa doesn't have (see the README).
+# =============================================================================
+
+esphome:
+  name: "spa"
+  friendly_name: "Spa"
+  min_version: 2026.8.0
+  name_add_mac_suffix: False
+  project:
+    name: Dino.ESP32
+    version: 1.0.0
+
+esp32:
+  board: lolin_s2_mini
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  logs:
+    BalboaSpa.CRC: NONE  # The spa bus is electrically noisy; hide the CRC error spam
+
+# Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+# Over-the-air updates
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Optional: a fixed address makes the spa easy to find on your network.
+  # manual_ip:
+  #   static_ip: 192.168.1.50
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  #   dns1: 192.168.1.1
+  # Fallback hotspot if Wi-Fi is lost. Always give it a password.
+  ap:
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# Web page and REST API on the ESP32 (also used by apps that talk to it directly).
+# Add auth: with a username and password if your network isn't trusted.
+web_server:
+  port: 80
+
+time:
+  - platform: homeassistant
+    id: ha_time
+  - platform: sntp  # The ESP32's own clock, so Ready At works even if Home Assistant is down
+    id: spa_clock
+    timezone: Europe/London  # Change to your time zone
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/brianfeucht/esphome-balboa-spa
+      ref: main  # You can pin this to a release tag or commit for repeatable builds
+
+uart:
+  id: spa_uart_bus
+  tx_pin: GPIO38
+  rx_pin: GPIO40
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  baud_rate: 115200
+  rx_buffer_size: 512  # 512+ recommended; must be over 128 on ESP-IDF
+
+balboa_spa:
+  id: spa
+  spa_temp_scale: C  # C or F, to match how your spa is set up
+
+# ---------------------------------------------------------------------------
+# Spa controls and sensors (from esphome-balboa-spa)
+# ---------------------------------------------------------------------------
+fan:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    jet_1:
+      name: "Jet 1"
+      max_toggle_attempts: 5  # Optional, default: 5
+      discard_updates: 20     # Optional, default: 20
+
+climate:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    name: "Spa Thermostat"
+    id: spa_therm
+    on_state:
+      - script.execute: ready_at_update  # Re-plan as soon as the target temperature changes
+    visual:
+      min_temperature: 10 °C
+      max_temperature: 40 °C
+      temperature_step: 0.5 °C
+
+sensor:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    blower:
+      name: Blower
+    fault_code:
+      name: Fault Code
+    fault_total_entries:
+      name: Fault Total Entries
+    fault_current_entry:
+      name: Fault Current Entry
+    fault_days_ago:
+      name: Fault Days Ago
+
+  - platform: wifi_signal
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: copy
+    source_id: wifi_signal_db
+    name: "WiFi Signal Percent"
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    entity_category: "diagnostic"
+
+  # Ready At planner: how long the next heat-up will take
+  - platform: template
+    name: "Heat-up Time Needed"
+    id: heat_needed
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+    accuracy_decimals: 0
+    update_interval: never
+
+binary_sensor:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    highrange:
+      name: High Range
+    circulation:
+      name: Circulation Pump
+      id: spa_circ  # Used by the Ready At temperature check
+    restmode:
+      name: Rest Mode
+    heatstate:
+      name: Heat State
+    connected:
+      name: Connected
+
+text:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    spa_time:
+      name: "Set Spa Time"
+      mode: TEXT
+    filter1_start_time:
+      name: "Set Filter 1 Start Time"
+      mode: TEXT
+    filter1_duration:
+      name: "Set Filter 1 Duration"
+      mode: TEXT
+    filter2_start_time:
+      name: "Set Filter 2 Start Time"
+      mode: TEXT
+    filter2_duration:
+      name: "Set Filter 2 Duration"
+      mode: TEXT
+
+  # Ready At planner: the time you want to get in (24-hour, e.g. 19:30).
+  # A text entity rather than a datetime one: adding a datetime entity currently stops
+  # esphome-balboa-spa's Sync Spa Time button from compiling (see the README).
+  - platform: template
+    name: "Ready At"
+    id: ready_at
+    icon: mdi:clock-check-outline
+    mode: TEXT
+    optimistic: true
+    restore_value: true
+    initial_value: "19:00"
+    min_length: 4
+    max_length: 5
+    pattern: "^([01]?[0-9]|2[0-3]):[0-5][0-9]$"
+    on_value:
+      - lambda: id(plan_started) = false;
+      - script.execute: ready_at_update
+
+text_sensor:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    spa_time:
+      name: "Spa Time"
+    filter1_config:
+      name: "Filter 1 Config"
+    filter2_config:
+      name: "Filter 2 Config"
+    fault_message:
+      name: "Fault Message"
+    fault_log_time:
+      name: "Fault Log Time"
+    reminder:
+      name: "Reminder"
+    component_version:
+      name: "Component Version"
+
+  # Ready At planner
+  - platform: template
+    name: "Heating Starts At"
+    id: plan_start_text
+    icon: mdi:clock-start
+    update_interval: never
+  - platform: template
+    name: "Ready At Status"
+    id: plan_status
+    icon: mdi:information-outline
+    update_interval: never
+  - platform: template
+    name: "Last Heat-up"
+    id: last_heatup
+    icon: mdi:chart-line
+    update_interval: never
+
+button:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    sync_time:
+      name: "Sync Spa Time"
+    disable_filter2:
+      name: "Disable Filter 2"
+    request_fault_log:
+      name: "Request Fault Log"
+    clear_reminder:
+      name: "Clear Reminder"
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+switch:
+  - platform: balboa_spa
+    balboa_spa_id: spa
+    light:
+      name: "LED Lights"
+
+  # Ready At planner on/off
+  - platform: template
+    name: "Ready At Schedule"
+    id: ready_plan
+    icon: mdi:calendar-clock
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - if:  # Not when the switch is just being restored at boot
+          condition:
+            lambda: return millis() > 60000;
+          then:
+            - script.execute: temp_probe
+    on_turn_off:
+      - script.stop: temp_probe
+      - lambda: |-
+          id(plan_started) = false;
+          if (id(probe_active)) {
+            id(probe_active) = false;
+            auto call = id(spa_therm).make_call();
+            call.set_mode(climate::CLIMATE_MODE_OFF);  // the check put it in Ready: put it back
+            call.perform();
+          }
+
+# =============================================================================
+# Ready At planner
+# Set "Ready At" and turn on "Ready At Schedule". The spa works out how long it
+# needs to heat (learned minutes per 0.5°C x half-degrees short + margin) and
+# switches from Rest to Ready at the right moment. Repeats every day.
+# Every heating run of an hour or more updates "Heat-up Minutes per 0.5°C".
+# =============================================================================
+globals:
+  - id: probe_active        # true while Ready At is taking a fresh temperature reading
+    type: bool
+    initial_value: 'false'
+  - id: plan_started
+    type: bool
+    initial_value: 'false'
+  - id: plan_ready_ts
+    type: uint32_t
+    initial_value: '0'
+  - id: trusted_temp        # last water temperature we believe is fresh
+    type: float
+    initial_value: 'NAN'
+  - id: trusted_ts
+    type: uint32_t
+    initial_value: '0'
+  - id: heat_start_temp     # current heating run, for learning the rate (kept through restarts)
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: heat_start_ts
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: heat_last_temp
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: heat_last_ts
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_run_start_temp # last finished heating run, shown as "Last Heat-up"
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: last_run_end_temp
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: last_run_minutes
+    type: float
+    restore_value: true
+    initial_value: '0'
+  - id: last_run_sample
+    type: float
+    restore_value: true
+    initial_value: '0'
+  - id: last_run_end_ts
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_run_learned
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+script:
+  # The planner itself. Runs every minute, and straight away when the target
+  # temperature, Ready At time or planner settings change.
+  - id: ready_at_update
+    mode: single
+    then:
+      - lambda: |-
+          auto now = id(spa_clock).now();
+          if (!now.is_valid()) {
+            id(plan_status).publish_state("Waiting for the clock");
+            return;
+          }
+          const uint32_t ts = (uint32_t) now.timestamp;
+          const float cur = id(spa_therm).current_temperature;
+          const float target = id(spa_therm).target_temperature;
+          const bool heating = id(spa_therm).action == climate::CLIMATE_ACTION_HEATING;
+          const bool ready_mode = id(spa_therm).mode == climate::CLIMATE_MODE_HEAT;
+
+          // 1. Remember the last water temperature we can trust
+          //    (pump running, heating, Ready mode, or the reading just changed)
+          static float prev_cur = NAN;
+          if (!std::isnan(cur)) {
+            const bool changed = !std::isnan(prev_cur) && cur != prev_cur;
+            if (!id(probe_active) && (heating || ready_mode || id(spa_circ).state || changed || id(trusted_ts) == 0)) {
+              id(trusted_temp) = cur;
+              id(trusted_ts) = ts;
+            }
+            prev_cur = cur;
+          }
+
+          // 2. Learn minutes per 0.5°C from every heating run of an hour or more.
+          //    Runs of 10 min+ are reported as "Last Heat-up"; runs of 60 min+ also update the rate.
+          static bool shown_last = false;
+          auto show_last = [&]() {
+            if (id(last_run_end_ts) == 0) return;
+            const int m = (int) id(last_run_minutes);
+            std::string text = str_sprintf("%.1f to %.1f°C in %dh %02dm", id(last_run_start_temp),
+                                           id(last_run_end_temp), m / 60, m % 60);
+            if (id(last_run_sample) > 0) text += str_sprintf(", %.1f min per 0.5°C", id(last_run_sample));
+            text += ", " + ESPTime::from_epoch_local(id(last_run_end_ts)).strftime("%d %b %H:%M");
+            text += id(last_run_learned) ? " (learned)" : " (too short to learn)";
+            id(last_heatup).publish_state(text);
+          };
+          if (!shown_last) {
+            show_last();
+            shown_last = true;
+          }
+
+          if (heating && !std::isnan(cur)) {
+            if (std::isnan(id(heat_start_temp))) {
+              id(heat_start_temp) = cur;
+              id(heat_start_ts) = ts;
+            }
+            id(heat_last_temp) = cur;
+            id(heat_last_ts) = ts;
+          } else if (!heating && !std::isnan(target) && !std::isnan(id(heat_start_temp))) {
+            // Only once the spa is talking again (target known), so a restart doesn't end the run early.
+            const float mins = (id(heat_last_ts) - id(heat_start_ts)) / 60.0f;
+            const float rise = id(heat_last_temp) - id(heat_start_temp);
+            if (mins >= 10.0f) {
+              const bool learn = mins >= 60.0f && rise >= 0.5f;
+              float sample = rise >= 0.5f ? mins / (rise / 0.5f) : 0.0f;
+              if (sample > 0) sample = std::max(5.0f, std::min(90.0f, sample));
+              id(last_run_start_temp) = id(heat_start_temp);
+              id(last_run_end_temp) = id(heat_last_temp);
+              id(last_run_minutes) = mins;
+              id(last_run_sample) = sample;
+              id(last_run_end_ts) = id(heat_last_ts);
+              id(last_run_learned) = learn;
+              if (learn) {
+                float learned = id(heat_rate).state * 0.7f + sample * 0.3f;  // blend, so it follows the seasons
+                learned = roundf(learned * 2.0f) / 2.0f;
+                ESP_LOGI("ready_at", "Heated %.1f°C in %.0f min = %.1f min per 0.5°C. Rate now %.1f",
+                         rise, mins, sample, learned);
+                auto call = id(heat_rate).make_call();
+                call.set_value(learned);
+                call.perform();
+              }
+              show_last();
+            }
+            id(heat_start_temp) = NAN;
+          }
+
+          // 3. Ready At plan
+          if (!id(ready_plan).state) {
+            id(plan_started) = false;
+            id(plan_status).publish_state("Off");
+            id(plan_start_text).publish_state("--");
+            return;
+          }
+          if (std::isnan(target)) {
+            id(plan_status).publish_state("Waiting for the spa");
+            return;
+          }
+          if (id(probe_active)) {
+            id(plan_status).publish_state("Checking water temperature…");
+            return;
+          }
+
+          // Estimate the water temperature now
+          float est = NAN;
+          if (id(trusted_ts) != 0) {
+            est = id(trusted_temp);
+            if (!ready_mode && !heating)
+              est -= id(cool_rate).state * ((ts - id(trusted_ts)) / 3600.0f);
+          }
+          if (std::isnan(est)) est = target - 6.0f;  // no reading yet: assume 6°C short
+
+          const int steps = std::max(0, (int) ceilf((target - est) / 0.5f - 0.01f));
+          const int need = std::min(1380, (int) ceilf(steps * id(heat_rate).state + id(plan_margin).state));
+          id(heat_needed).publish_state(need);
+
+          const int now_m = now.hour * 60 + now.minute;
+          int rh = -1, rm = -1;
+          if (sscanf(id(ready_at).state.c_str(), "%d:%d", &rh, &rm) != 2 || rh < 0 || rh > 23 || rm < 0 || rm > 59) {
+            id(plan_status).publish_state("Set Ready At as HH:MM");
+            return;
+          }
+          const int ready_m = rh * 60 + rm;
+          int until = ready_m - now_m;
+          if (until <= 0) until += 1440;
+          const int start_m = ((ready_m - need) % 1440 + 1440) % 1440;
+          id(plan_start_text).publish_state(str_sprintf("%02d:%02d", start_m / 60, start_m % 60));
+
+          if (!id(plan_started)) {
+            if (until > need) {
+              id(plan_status).publish_state(str_sprintf("Will heat from %02d:%02d", start_m / 60, start_m % 60));
+              return;
+            }
+            id(plan_started) = true;
+            id(plan_ready_ts) = ts + until * 60;
+            ESP_LOGI("ready_at", "Heating now: about %.1f°C -> %.1f°C, needs ~%d min, ready at %02d:%02d",
+                     est, target, need, ready_m / 60, ready_m % 60);
+            if (!ready_mode) {
+              auto call = id(spa_therm).make_call();
+              call.set_mode(climate::CLIMATE_MODE_HEAT);
+              call.perform();
+            }
+          }
+
+          // Plan running
+          if (ts < id(plan_ready_ts)) {
+            const bool at_temp = !std::isnan(cur) && cur >= target - 0.25f;
+            id(plan_status).publish_state(at_temp
+              ? std::string("Up to temperature")
+              : str_sprintf("Heating, ready by %02d:%02d", ready_m / 60, ready_m % 60));
+            return;
+          }
+          const float back = id(rest_after).state;
+          if (back <= 0.0f) {
+            id(plan_started) = false;  // stay in Ready mode, plan again tomorrow
+            return;
+          }
+          const uint32_t rest_ts = id(plan_ready_ts) + (uint32_t) (back * 3600.0f);
+          if (ts >= rest_ts) {
+            ESP_LOGI("ready_at", "Back to Rest mode");
+            auto call = id(spa_therm).make_call();
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+            id(plan_started) = false;
+          } else {
+            const int rest_m = (ready_m + (int) (back * 60.0f)) % 1440;
+            id(plan_status).publish_state(str_sprintf("Enjoy! Back to Rest at %02d:%02d", rest_m / 60, rest_m % 60));
+          }
+
+  # Fresh temperature reading when Ready At is switched on. In Rest mode the spa only
+  # measures the water when the pump runs, so switch to Ready, wait for the pump plus a
+  # minute, take the reading, then go back to Rest (unless it's time to start heating).
+  - id: temp_probe
+    mode: restart
+    then:
+      - wait_until:  # Spa must be talking first, so we never toggle Rest/Ready blind
+          condition:
+            lambda: return !std::isnan(id(spa_therm).target_temperature);
+          timeout: 2min
+      - lambda: |-
+          id(probe_active) = !std::isnan(id(spa_therm).target_temperature)
+                             && id(spa_therm).mode == climate::CLIMATE_MODE_OFF;
+          if (id(probe_active)) {
+            ESP_LOGI("ready_at", "Checking water temperature (Ready for a minute)");
+            id(plan_status).publish_state("Checking water temperature…");
+            auto call = id(spa_therm).make_call();
+            call.set_mode(climate::CLIMATE_MODE_HEAT);
+            call.perform();
+          }
+      - if:
+          condition:
+            lambda: return id(probe_active);
+          then:
+            - wait_until:
+                condition:
+                  binary_sensor.is_on: spa_circ
+                timeout: 2min
+            - delay: 60s
+            - lambda: |-
+                const float cur = id(spa_therm).current_temperature;
+                auto now = id(spa_clock).now();
+                if (!std::isnan(cur) && now.is_valid()) {
+                  id(trusted_temp) = cur;
+                  id(trusted_ts) = (uint32_t) now.timestamp;
+                  ESP_LOGI("ready_at", "Fresh reading: %.1f°C", cur);
+                }
+                id(probe_active) = false;
+                if (!id(plan_started) && id(spa_therm).mode == climate::CLIMATE_MODE_HEAT) {
+                  auto call = id(spa_therm).make_call();
+                  call.set_mode(climate::CLIMATE_MODE_OFF);
+                  call.perform();
+                }
+
+# Ready At settings (shown in Home Assistant under Configuration)
+number:
+  - platform: template
+    name: "Heat-up Minutes per 0.5°C"
+    id: heat_rate
+    icon: mdi:thermometer-chevron-up
+    unit_of_measurement: "min"
+    min_value: 5
+    max_value: 90
+    step: 0.5
+    initial_value: 20  # Starting guess; it learns from every heat-up of an hour or more
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    name: "Cool-down °C per Hour"
+    id: cool_rate
+    icon: mdi:thermometer-chevron-down
+    unit_of_measurement: "°C/h"
+    min_value: 0
+    max_value: 2
+    step: 0.05
+    initial_value: 0.3
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: ready_at_update
+  - platform: template
+    name: "Ready At Margin"
+    id: plan_margin
+    icon: mdi:timer-plus-outline
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 120
+    step: 5
+    initial_value: 15
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: ready_at_update
+  - platform: template
+    name: "Back to Rest After"
+    id: rest_after
+    icon: mdi:sleep
+    unit_of_measurement: "h"
+    min_value: 0
+    max_value: 12
+    step: 0.5
+    initial_value: 0  # 0 = stay in Ready after the Ready At time
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute: ready_at_update
+
+interval:
+  - interval: 60s
+    then:
+      - script.execute: ready_at_update
